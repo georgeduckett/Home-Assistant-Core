@@ -13,7 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
-from .models import IdealLedData, iDealLed
+from .iDealLed import IdealLedData, iDealLed
 
 _LOGGER = logging.getLogger(__name__)
 
