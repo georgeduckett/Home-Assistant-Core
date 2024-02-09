@@ -10,11 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, UPDATE_SECONDS
 from .errors import IDEALLED_EXCEPTIONS
-from .models import IdealLedData, iDealLed
+from .iDealLed import IdealLedData, iDealLed
 
 # TODO List the platforms that you want to support.
 # For your initial PR, limit it to 1 platform.
@@ -89,4 +90,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         data: IdealLedData = hass.data[DOMAIN].pop(entry.entry_id)
         await data.lock.disconnect()
 
+    return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: DeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    if unload_ok := await hass.config_entries.async_remove(config_entry.entry_id):
+        data: IdealLedData = hass.data[DOMAIN].pop(config_entry.entry_id)
+        await data.lock.disconnect()
     return unload_ok

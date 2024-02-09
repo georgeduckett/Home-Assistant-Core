@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
 from .iDealLed import IdealLedData, iDealLed
+from .models import DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +43,20 @@ class iDealLedLight(LightEntity):
         self._name = iDealLedDevice.name
         self._state = None
         self._brightness = None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return the device info."""
+        return DeviceInfo(
+            identifiers={
+                # Serial numbers are unique identifiers within a specific domain
+                (DOMAIN, self.name)
+            },
+            name=self.name,
+            device_id=self.name,
+            model=self.light.productname,
+            # TODO: Get other properties if we can
+        )
 
     @property
     def name(self) -> str:
