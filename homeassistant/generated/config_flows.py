@@ -234,6 +234,7 @@ FLOWS = {
         "ibeacon",
         "icloud",
         "idasen_desk",
+        "idealled",
         "ifttt",
         "imap",
         "improv_ble",
