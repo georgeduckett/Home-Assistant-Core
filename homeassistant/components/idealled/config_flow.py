@@ -1,167 +1,239 @@
-"""Config flow for iDeal LED."""
-from __future__ import annotations
-
-from collections.abc import Mapping
+import asyncio
 import logging
 from typing import Any
 
+from bluetooth_data_tools import human_readable_name
+from bluetooth_sensor_state_data import BluetoothData
+from home_assistant_bluetooth import BluetoothServiceInfo
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
-    async_last_service_info,
 )
-from homeassistant.const import CONF_ADDRESS
+from homeassistant.const import CONF_MAC
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.device_registry import format_mac
 
-from .const import DOMAIN
-from .models import iDealLed
+from .const import CONF_DELAY, CONF_RESET, DOMAIN
+from .idealled import IDEALLEDInstance
 
-_LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
+DATA_SCHEMA = vol.Schema({("host"): str})
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for iDealLed."""
+class DeviceData(BluetoothData):
+    def __init__(self, discovery_info) -> None:
+        self._discovery = discovery_info
+        LOGGER.debug(
+            "Discovered bluetooth devices, DeviceData, : %s , %s",
+            self._discovery.address,
+            self._discovery.name,
+        )
 
+    def supported(self):
+        return self._discovery.name.lower().startswith("isp-")
+
+    def address(self):
+        return self._discovery.address
+
+    def get_device_name(self):
+        return human_readable_name(None, self._discovery.name, self._discovery.address)
+
+    def name(self):
+        return human_readable_name(None, self._discovery.name, self._discovery.address)
+
+    def rssi(self):
+        return self._discovery.rssi
+
+    def _start_update(self, service_info: BluetoothServiceInfo) -> None:
+        """Update from BLE advertisement data."""
+        LOGGER.debug("Parsing BLE advertisement data: %s", service_info)
+
+
+class BJLEDFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
-
-    _reauth_entry: config_entries.ConfigEntry | None = None
+    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
 
     def __init__(self) -> None:
-        """Initialize the config flow."""
-        self._lock: iDealLed | None = None
-        # Populated by user step
-        self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
-        # Populated by bluetooth, reauth_confirm and user steps
+        self.mac = None
+        self._device = None
+        self._instance = None
+        self.name = None
         self._discovery_info: BluetoothServiceInfoBleak | None = None
+        self._discovered_device: DeviceData | None = None
+        self._discovered_devices = []
+
+    async def async_step_bluetooth(
+        self, discovery_info: BluetoothServiceInfoBleak
+    ) -> FlowResult:
+        """Handle the bluetooth discovery step."""
+        LOGGER.debug(
+            "Discovered bluetooth devices, step bluetooth, : %s , %s",
+            discovery_info.address,
+            discovery_info.name,
+        )
+        await self.async_set_unique_id(discovery_info.address)
+        self._abort_if_unique_id_configured()
+        device = DeviceData(discovery_info)
+        self.context["title_placeholders"] = {"name": device.name()}
+        if device.supported():
+            self._discovered_devices.append(device)
+            return await self.async_step_bluetooth_confirm()
+        else:
+            return self.async_abort(reason="not_supported")
+
+    async def async_step_bluetooth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Confirm discovery."""
+        LOGGER.debug(
+            "Discovered bluetooth devices, step bluetooth confirm, : %s", user_input
+        )
+        self._set_confirm_only()
+        return await self.async_step_user()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Handle the user step to pick discovered device."""
-        errors: dict[str, str] = {}
-
         if user_input is not None:
-            address = user_input[CONF_ADDRESS]
-            await self.async_set_unique_id(address, raise_on_progress=False)
-            # Guard against the user selecting a device which has been configured by
-            # another flow.
+            self.mac = user_input[CONF_MAC]
+            self.name = self.context["title_placeholders"]["name"]
+            await self.async_set_unique_id(self.mac, raise_on_progress=False)
             self._abort_if_unique_id_configured()
-            self._discovery_info = self._discovered_devices[address]
-            return await self.async_step_associate()
+            return await self.async_step_validate()
 
         current_addresses = self._async_current_ids()
-        for discovery in async_discovered_service_info(self.hass):
-            if (
-                discovery.address in current_addresses
-                or discovery.address in self._discovered_devices
-                # or not device_filter(discovery.advertisement)
-            ):
+        for discovery_info in async_discovered_service_info(self.hass):
+            self.mac = discovery_info.address
+            if self.mac in current_addresses:
+                LOGGER.debug("Device %s in current_addresses", (self.mac))
                 continue
-            self._discovered_devices[discovery.address] = discovery
+            if (
+                device
+                for device in self._discovered_devices
+                if device.address == self.mac
+            ) == ([]):
+                # LOGGER.debug("Device %s in discovered_devices", (device))
+                continue
+            device = DeviceData(discovery_info)
+            if device.supported():
+                self._discovered_devices.append(device)
 
         if not self._discovered_devices:
-            return self.async_abort(reason="no_devices_found")
+            return await self.async_step_manual()
 
-        data_schema = vol.Schema(
-            {
-                vol.Required(CONF_ADDRESS): vol.In(
-                    {
-                        service_info.address: (
-                            f"{service_info.name} ({service_info.address})"
-                        )
-                        for service_info in self._discovered_devices.values()
-                    }
-                ),
-            }
+        LOGGER.debug(
+            "Discovered supported devices: %s - %s",
+            self._discovered_devices[0].name(),
+            self._discovered_devices[0].address(),
         )
+
+        mac_dict = {dev.address(): dev.name() for dev in self._discovered_devices}
         return self.async_show_form(
             step_id="user",
-            data_schema=data_schema,
-            errors=errors,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_MAC): vol.In(mac_dict),
+                }
+            ),
+            errors={},
         )
 
-    async def async_step_bluetooth(
-        self, discovery_info: BluetoothServiceInfoBleak
-    ) -> FlowResult:
-        """Handle the Bluetooth discovery step."""
-        await self.async_set_unique_id(discovery_info.address)
-        self._abort_if_unique_id_configured()
-        self._discovery_info = discovery_info
-        name = self._discovery_info.name or self._discovery_info.address
-        self.context["title_placeholders"] = {"name": name}
-        return await self.async_step_bluetooth_confirm()
+    async def async_step_validate(self, user_input: "dict[str, Any] | None" = None):
+        if user_input is not None:
+            if "flicker" in user_input:
+                if user_input["flicker"]:
+                    return self.async_create_entry(
+                        title=self.name, data={CONF_MAC: self.mac, "name": self.name}
+                    )
+                return self.async_abort(reason="cannot_validate")
 
-    async def async_step_bluetooth_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle bluetooth confirm step."""
-        # mypy is not aware that we can't get here without having these set already
-        assert self._discovery_info is not None
+            if "retry" in user_input and not user_input["retry"]:
+                return self.async_abort(reason="cannot_connect")
 
-        if user_input is None:
-            name = self._discovery_info.name or self._discovery_info.address
+        error = await self.toggle_light()
+
+        if error:
             return self.async_show_form(
-                step_id="bluetooth_confirm",
-                description_placeholders={"name": name},
+                step_id="validate",
+                data_schema=vol.Schema({vol.Required("retry"): bool}),
+                errors={"base": "connect"},
             )
 
-        return await self.async_step_associate()
-
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
-        """Handle reauthorization request."""
-        self._reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
+        return self.async_show_form(
+            step_id="validate",
+            data_schema=vol.Schema({vol.Required("flicker"): bool}),
+            errors={},
         )
-        return await self.async_step_reauth_confirm()
 
-    async def async_step_reauth_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle reauthorization flow."""
-        errors = {}
-        reauth_entry = self._reauth_entry
-        assert reauth_entry is not None
-
+    async def async_step_manual(self, user_input: "dict[str, Any] | None" = None):
         if user_input is not None:
-            if (
-                discovery_info := async_last_service_info(
-                    self.hass, reauth_entry.data[CONF_ADDRESS], True
-                )
-            ) is None:
-                errors = {"base": "no_longer_in_range"}
-            else:
-                self._discovery_info = discovery_info
-                return await self.async_step_associate()
+            self.mac = user_input[CONF_MAC]
+            self.name = user_input["name"]
+            await self.async_set_unique_id(format_mac(self.mac))
+            return await self.async_step_validate()
 
         return self.async_show_form(
-            step_id="reauth_confirm", data_schema=vol.Schema({}), errors=errors
+            step_id="manual",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_MAC): str, vol.Required("name"): str}
+            ),
+            errors={},
         )
 
-    async def async_step_associate(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle associate step."""
-        # mypy is not aware that we can't get here without having these set already
-        assert self._discovery_info is not None
+    async def toggle_light(self):
+        if not self._instance:
+            self._instance = IDEALLEDInstance(self.mac, False, 120, self.hass)
+        try:
+            await self._instance.update()
+            await self._instance.turn_on()
+            await asyncio.sleep(1)
+            await self._instance.turn_off()
+            await asyncio.sleep(1)
+            await self._instance.turn_on()
+            await asyncio.sleep(1)
+            await self._instance.turn_off()
+        except Exception as error:
+            return error
+        finally:
+            await self._instance.stop()
 
-        if not self._lock:
-            self._lock = iDealLed(self._discovery_info.device)
-        lock = self._lock
+    @staticmethod
+    @callback
+    def async_get_options_flow(entry: config_entries.ConfigEntry):
+        return OptionsFlowHandler(entry)
 
-        data = {
-            CONF_ADDRESS: self._discovery_info.device.address,
-        }
-        if reauth_entry := self._reauth_entry:
-            self.hass.config_entries.async_update_entry(reauth_entry, data=data)
-            await self.hass.config_entries.async_reload(reauth_entry.entry_id)
-            return self.async_abort(reason="reauth_successful")
 
-        return self.async_create_entry(
-            title=lock.device_info.device_name
-            or lock.device_info.device_id
-            or lock.name,
-            data=data,
+class OptionsFlowHandler(config_entries.OptionsFlow):
+    def __init__(self, config_entry):
+        """Initialize options flow."""
+        self.config_entry = config_entry
+
+    async def async_step_init(self, _user_input=None):
+        """Manage the options."""
+        return await self.async_step_user()
+
+    async def async_step_user(self, user_input=None):
+        """Handle a flow initialized by the user."""
+        errors = {}
+        options = self.config_entry.options or {CONF_RESET: False, CONF_DELAY: 120}
+        if user_input is not None:
+            return self.async_create_entry(
+                title="",
+                data={
+                    CONF_RESET: user_input[CONF_RESET],
+                    CONF_DELAY: user_input[CONF_DELAY],
+                },
+            )
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema(
+                {vol.Optional(CONF_DELAY, default=options.get(CONF_DELAY)): int}
+            ),
+            errors=errors,
         )
