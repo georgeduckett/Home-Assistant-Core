@@ -1,149 +1,403 @@
-"""The iDealLED device model."""
-from __future__ import annotations
-
 import asyncio
-from dataclasses import dataclass
-import inspect
+from collections.abc import Callable
+import colorsys
 import logging
+import traceback
+from typing import Any, Tuple, TypeVar, cast
 
-from bleak import BleakClient
 from bleak.backends.device import BLEDevice
-from bleak.backends.scanner import AdvertisementData
+from bleak.backends.service import BleakGATTCharacteristic, BleakGATTServiceCollection
+from bleak.exc import BleakDBusError
 from bleak_retry_connector import (
+    BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS,
     BleakClientWithServiceCache,
+    BleakNotFoundError,
     establish_connection,
-    retry_bluetooth_connection_error,
+)
+from Crypto.Cipher import AES
+
+# from datetime import datetime
+from homeassistant.components import bluetooth
+from homeassistant.components.light import ColorMode
+from homeassistant.exceptions import ConfigEntryNotReady
+
+# Add effects information in a separate file because there is a LOT of boilerplate.
+
+LOGGER = logging.getLogger(__name__)
+
+EFFECT_01 = "Effect 01"
+EFFECT_02 = "Effect 02"
+EFFECT_03 = "Effect 03"
+EFFECT_04 = "Effect 04"
+EFFECT_05 = "Effect 05"
+EFFECT_06 = "Effect 06"
+EFFECT_07 = "Effect 07"
+EFFECT_08 = "Effect 08"
+EFFECT_09 = "Effect 09"
+EFFECT_10 = "Effect 10"
+
+EFFECT_MAP = {
+    EFFECT_01: 1,
+    EFFECT_02: 2,
+    EFFECT_03: 3,
+    EFFECT_04: 4,
+    EFFECT_05: 5,
+    EFFECT_06: 6,
+    EFFECT_07: 7,
+    EFFECT_08: 8,
+    EFFECT_09: 9,
+    EFFECT_10: 10,
+}
+
+EFFECT_LIST = sorted(EFFECT_MAP)
+EFFECT_ID_NAME = {v: k for k, v in EFFECT_MAP.items()}
+
+NAME_ARRAY = ["IDL-"]
+WRITE_CMD_CHARACTERISTIC_UUIDS = ["d44bc439-abfd-45a2-b575-925416129600"]
+WRITE_COL_CHARACTERISTIC_UUIDS = ["d44bc439-abfd-45a2-b575-92541612960a"]
+NOTIFY_CHARACTERISTIC_UUIDS = ["d44bc439-abfd-45a2-b575-925416129601"]
+SECRET_ENCRYPTION_KEY = bytes(
+    [
+        0x34,
+        0x52,
+        0x2A,
+        0x5B,
+        0x7A,
+        0x6E,
+        0x49,
+        0x2C,
+        0x08,
+        0x09,
+        0x0A,
+        0x9D,
+        0x8D,
+        0x2A,
+        0x23,
+        0xF8,
+    ]
 )
 
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .errors import Disconnected, DisconnectReason, NotConnected, Timeout, iDealLedError
-from .models import BaseProcedure, DeviceInfo, NullProcedure
-
-DISCONNECT_DELAY = 180
 DEFAULT_ATTEMPTS = 3
+BLEAK_BACKOFF_TIME = 0.25
+RETRY_BACKOFF_EXCEPTIONS = BleakDBusError
 
-_LOGGER = logging.getLogger(__name__)
-
-
-@dataclass
-class IdealLedData:
-    """Data for the iDealLed integration."""
-
-    lock: iDealLed
-    coordinator: DataUpdateCoordinator[None]
+WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 
-class iDealLed:
-    """Class representing an iDealLed."""
+def bytearray_to_hex_format(byte_array):
+    hex_strings = [f"0x{byte:02x}" for byte in byte_array]
+    return hex_strings
 
-    coordinator: DataUpdateCoordinator[None]
-    brightness: int
 
-    def __init__(
-        self, ble_device: BLEDevice, advertisement_data: AdvertisementData | None = None
-    ) -> None:
-        """Initialise."""
-        self._procedure_lock: asyncio.Lock = (
-            asyncio.Lock()
-        )  # Lock to ensure a single procedure runs at once
-        self._connect_lock: asyncio.Lock = (
-            asyncio.Lock()
-        )  # Lock to ensure a single connect happens at once
-        self._client: BleakClient | None = None  # test
-        self._ble_device = ble_device
-        self._advertisement_data = advertisement_data
-        self._disconnect_reason: DisconnectReason | None = None
-        self._disconnect_timer: asyncio.TimerHandle | None = None
-        self._expected_disconnect: bool = False
-        self.loop = asyncio.get_running_loop()
-        self.device_info = DeviceInfo()
+def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
+    async def _async_wrap_retry_bluetooth_connection_error(
+        self: "IDEALLEDInstance", *args: Any, **kwargs: Any
+    ) -> Any:
+        attempts = DEFAULT_ATTEMPTS
+        max_attempts = attempts - 1
 
-    @property
-    def name(self) -> str:
-        """Get the name of the device."""
-        return str(self._ble_device.name or self._ble_device.address)
-
-    @property
-    def rssi(self) -> int | None:
-        """Get the rssi of the device."""
-        if self._advertisement_data:
-            return self._advertisement_data.rssi
-        return None
-
-    def set_ble_device_and_advertisement_data(
-        self, ble_device: BLEDevice, advertisement_data: AdvertisementData
-    ) -> None:
-        """Set the ble device."""
-        _LOGGER.debug("%s: %s", self.name, inspect.currentframe().f_code.co_name)
-        self._ble_device = ble_device
-        self._advertisement_data = advertisement_data
-
-    async def update(self) -> bool:
-        """Update the lock's status."""
-        _LOGGER.debug("%s: Update", self.name)
-        null_proc = NullProcedure(self)
-        return await self._execute(null_proc)
-
-    async def connect(self) -> None:
-        """Connect the lock.
-
-        Note: A connection is automatically established when performing an operation
-        on the lock. This can be called to ensure the lock is in range.
-        """
-        _LOGGER.info("%s: Connect", self.name)
-        await self._ensure_connected()
-
-    async def disconnect(self) -> None:
-        """Disconnect from the lock."""
-        _LOGGER.info("%s: Disconnect", self.name)
-        await self._execute_disconnect(DisconnectReason.USER_REQUESTED)
-
-    @retry_bluetooth_connection_error(DEFAULT_ATTEMPTS)  # type: ignore[misc]
-    async def _execute(self, procedure: BaseProcedure) -> bool:
-        """Execute a procedure."""
-        _LOGGER.debug(
-            "%s: %s(%s)",
-            self.name,
-            inspect.currentframe().f_code.co_name,
-            procedure.__class__.__name__,
-        )
-        if self._procedure_lock.locked():
-            _LOGGER.debug(
-                "%s: Procedure already in progress, waiting for it to complete; "
-                "RSSI: %s",
-                self.name,
-                self.rssi,
-            )
-        async with self._procedure_lock:
+        for attempt in range(attempts):
             try:
-                await self._ensure_connected()
-                _LOGGER.debug("%s: About to run procedure", self.name)
-                result = await procedure.execute()
-                _LOGGER.debug("%s: Ran procedure", self.name)
-                return result
-            except asyncio.CancelledError as err:
-                if self._disconnect_reason is None:
-                    _LOGGER.debug("%s: Cancelled", self.name)
-                    raise iDealLedError from err
-                if self._disconnect_reason == DisconnectReason.TIMEOUT:
-                    _LOGGER.debug("%s: Timeout", self.name)
-                    raise Timeout from err
-                _LOGGER.debug("%s: Disconnected", self.name)
-                raise Disconnected(self._disconnect_reason) from err
-            except iDealLedError:
-                self._disconnect(DisconnectReason.ERROR)
+                return await func(self, *args, **kwargs)
+            except BleakNotFoundError:
+                # The lock cannot be found so there is no
+                # point in retrying.
                 raise
+            except RETRY_BACKOFF_EXCEPTIONS as err:
+                if attempt >= max_attempts:
+                    LOGGER.debug(
+                        "%s: %s error calling %s, reach max attempts (%s/%s)",
+                        self.name,
+                        type(err),
+                        func,
+                        attempt,
+                        max_attempts,
+                        exc_info=True,
+                    )
+                    raise
+                LOGGER.debug(
+                    "%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",
+                    self.name,
+                    type(err),
+                    func,
+                    BLEAK_BACKOFF_TIME,
+                    attempt,
+                    max_attempts,
+                    exc_info=True,
+                )
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
+            except BLEAK_EXCEPTIONS as err:
+                if attempt >= max_attempts:
+                    LOGGER.debug(
+                        "%s: %s error calling %s, reach max attempts (%s/%s): %s",
+                        self.name,
+                        type(err),
+                        func,
+                        attempt,
+                        max_attempts,
+                        err,
+                        exc_info=True,
+                    )
+                    raise
+                LOGGER.debug(
+                    "%s: %s error calling %s, retrying  (%s/%s)...: %s",
+                    self.name,
+                    type(err),
+                    func,
+                    attempt,
+                    max_attempts,
+                    err,
+                    exc_info=True,
+                )
+
+    return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
+
+
+class IDEALLEDInstance:
+    def __init__(self, address, reset: bool, delay: int, hass) -> None:
+        self.loop = asyncio.get_running_loop()
+        self._mac = address
+        self._reset = reset
+        self._delay = delay
+        self._hass = hass
+        self._device: BLEDevice | None = None
+        self._device = bluetooth.async_ble_device_from_address(self._hass, address)
+        if not self._device:
+            raise ConfigEntryNotReady(
+                f"You need to add bluetooth integration (https://www.home-assistant.io/integrations/bluetooth) or couldn't find a nearby device with address: {address}"
+            )
+        self._connect_lock: asyncio.Lock = asyncio.Lock()
+        self._client: BleakClientWithServiceCache | None = None
+        self._disconnect_timer: asyncio.TimerHandle | None = None
+        self._cached_services: BleakGATTServiceCollection | None = None
+        self._expected_disconnect = False
+        self._is_on = None
+        self._rgb_color = (255, 0, 0)
+        self._brightness = 255
+        self._effect = None
+        self._effect_speed = 0x64
+        self._color_mode = ColorMode.RGB
+        self._write_uuid = None
+        self._write_colour_uuid = None
+        self._read_uuid = None
+        self._turn_on_cmd = None
+        self._turn_off_cmd = None
+        self._model = self._detect_model()
+        self._on_update_callbacks = []
+
+        LOGGER.debug(
+            "Model information for device %s : ModelNo %s. MAC: %s",
+            self._device.name,
+            self._model,
+            self._mac,
+        )
+
+    def _detect_model(self):
+        x = 0
+        for name in NAME_ARRAY:
+            if self._device.name.lower().startswith(
+                name.lower()
+            ):  # TODO: match on BLE provided model instead of name
+                return x
+            x = x + 1
+
+    async def _write(self, data: bytearray):
+        """Send command to device and read response."""
+        await self._ensure_connected()
+        cipher = AES.new(SECRET_ENCRYPTION_KEY, AES.MODE_ECB)
+        ciphered_data = cipher.encrypt(data)
+        await self._write_while_connected(ciphered_data)
+
+    async def _write_colour_data(self, data: bytearray):
+        """Send command to device and read response."""
+        await self._ensure_connected()
+        await self._write_colour_while_connected(data)
+
+    async def _write_while_connected(self, data: bytearray):
+        LOGGER.debug(f"Writing data to {self.name}: {data}")
+        await self._client.write_gatt_char(self._write_uuid, data, False)
+
+    async def _write_colour_while_connected(self, data: bytearray):
+        LOGGER.debug(f"Writing colour data to {self.name}: {data}")
+        await self._client.write_gatt_char(self._write_colour_uuid, data, False)
+
+    def _notification_handler(
+        self, _sender: BleakGATTCharacteristic, data: bytearray
+    ) -> None:
+        # This doesn't work.  I can't get the controller to send notifications.
+        """Handle BLE notifications from the device.  Update internal state to reflect the device state."""
+        cipher = AES.new(SECRET_ENCRYPTION_KEY, AES.MODE_ECB)
+        clear_data = cipher.decrypt(data)
+        LOGGER.debug(
+            f"BLE Notification: {self.name}: {bytearray_to_hex_format(clear_data)}"
+        )
+        # self.local_callback()
+
+    @property
+    def mac(self):
+        return self._device.address
+
+    @property
+    def reset(self):
+        return self._reset
+
+    @property
+    def name(self):
+        return self._device.name
+
+    @property
+    def rssi(self):
+        return self._device.rssi
+
+    @property
+    def is_on(self):
+        return self._is_on
+
+    @property
+    def brightness(self):
+        return self._brightness
+
+    @property
+    def rgb_color(self):
+        return self._rgb_color
+
+    @property
+    def effect_list(self) -> list[str]:
+        return EFFECT_LIST
+
+    @property
+    def effect(self):
+        return self._effect
+
+    @property
+    def color_mode(self):
+        return self._color_mode
+
+    async def set_brightness(self, brightness: int):
+        LOGGER.info("Brightness only: " + str(brightness))
+        if brightness == self._brightness:
+            return
+        else:
+            self._brightness = brightness
+            if self._effect is not None:
+                await self.set_effect(self._effect, self._brightness)
+            else:
+                await self.set_rgb_color(self._rgb_color, self._brightness)
+
+    @retry_bluetooth_connection_error
+    async def set_rgb_color(
+        self, rgb: Tuple[int, int, int], brightness: int | None = None
+    ):
+        if None in rgb:
+            rgb = self._rgb_color
+        self._rgb_color = rgb
+        self._effect = None
+        self._color_mode = ColorMode.RGB
+        if brightness is None:
+            if self._brightness is None:
+                self._brightness = 255
+            else:
+                brightness = self._brightness
+        brightness_percent = int(brightness * 100 / 255)
+        # Now adjust the RBG values to match the brightness
+        red = int(rgb[0] * brightness_percent / 100)
+        green = int(rgb[1] * brightness_percent / 100)
+        blue = int(rgb[2] * brightness_percent / 100)
+        # RGB packet
+        # rgb_packet = bytearray.fromhex(
+        #    "0F 53 47 4C 53 00 00 64 50 1F 00 00 1F 00 00 32"
+        # )
+        red = int(
+            red >> 3
+        )  # You CAN send 8 bit colours to this thing, but you probably shouldn't for power reasons.  Thanks to the good folks at Hacker News for that insight.
+        green = int(green >> 3)
+        blue = int(blue >> 3)
+        rgb_packet = bytearray(
+            [7, 67, 79, 76, 79, green, red, blue, 0, 0, 0, 0, 0, 0, 0, 0]
+        )
+        await self._write(rgb_packet)
+
+    @retry_bluetooth_connection_error
+    # effect, reverse=0, speed=50, saturation=50, colour_data=COLOUR_DATA
+    async def set_effect(self, effect: str, brightness: int | None = NotImplemented):
+        return
+        if effect not in EFFECT_LIST:
+            LOGGER.error("Effect %s not supported", effect)
+            return
+        self._effect = effect
+        self._color_mode = None
+        effect_id = EFFECT_MAP.get(effect)
+        if effect_id > 11:
+            effect = 11
+        brightness_pct = int(brightness * 100 / 255)
+        packet = bytearray.fromhex("0A 4D 55 4C 54 08 00 64 50 07 32 00 00 00 00 00")
+        packet[5] = effect_id
+        packet[6] = 0  # reverse
+        packet[8] = 50  # speed
+        packet[10] = 100  # brightness_pct # 50 # saturation (brightness?)
+        await self._write(packet)
+        # Now we send the colour data
+        await self.write_colour_data()
+
+    @retry_bluetooth_connection_error
+    async def write_colour_data(self):
+        return
+        # This is sent after switching to an effect to tell the device what sort of pattern to show.
+        # In the app you can edit this yourself, but HA doesn't have the UI for such a thing
+        # so for now I'm just going to hardcode it to a rainbow pattern.  You could change this to
+        # whatever you want, but for an effect the maximum length is 7 colours.
+        brightness_pct = int(self._brightness * 100 / 255)
+        colour_list = []
+        colour_divisions = int(360 / 7)
+        for i in range(7):
+            h = i * colour_divisions
+            r, g, b = colorsys.hsv_to_rgb(h / 360, 1, brightness_pct / 100.0)
+            r = int(r * 255)
+            g = int(g * 255)
+            b = int(b * 255)
+            colour_list.append((r, g, b))
+        # print(f"Colour list: {colour_list}")
+        length = len(colour_list)
+        colour_data = []
+        colour_data.append(length * 3)  # 3 bytes per colour
+        colour_data.append(0)  # Don't know what this is, perhaps just a separator
+        for colour in colour_list:
+            colour_data.append(colour[0])
+            colour_data.append(colour[1])
+            colour_data.append(colour[2])
+        await self._write_colour_data(colour_data)
+
+    @retry_bluetooth_connection_error
+    async def turn_on(self):
+        packet = bytearray.fromhex("05 54 55 52 4E 01 00 00 00 00 00 00 00 00 00 00")
+        await self._write(packet)
+        self._is_on = True
+
+    @retry_bluetooth_connection_error
+    async def turn_off(self):
+        packet = bytearray.fromhex("05 54 55 52 4E 00 00 00 00 00 00 00 00 00 00 00")
+        await self._write(packet)
+        self._is_on = False
+
+    @retry_bluetooth_connection_error
+    async def update(self):
+        LOGGER.debug("%s: Update in lwdnetwf called", self.name)
+        try:
+            await self._ensure_connected()
+            self._is_on = False
+        except Exception as error:
+            self._is_on = None  # failed to connect, this should mark it as unavailable
+            LOGGER.error("Error getting status: %s", error)
+            track = traceback.format_exc()
+            LOGGER.debug(track)
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
-        _LOGGER.debug("%s: %s", self.name, inspect.currentframe().f_code.co_name)
         if self._connect_lock.locked():
-            _LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete; "
-                "RSSI: %s",
+            LOGGER.debug(
+                "%s: Connection already in progress, waiting for it to complete",
                 self.name,
-                self.rssi,
             )
         if self._client and self._client.is_connected:
             self._reset_disconnect_timer()
@@ -153,130 +407,103 @@ class iDealLed:
             if self._client and self._client.is_connected:
                 self._reset_disconnect_timer()
                 return
-            _LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
+            LOGGER.debug("%s: Connecting", self.name)
             client = await establish_connection(
                 BleakClientWithServiceCache,
-                self._ble_device,
+                self._device,
                 self.name,
                 self._disconnected,
-                use_services_cache=True,
-                ble_device_callback=lambda: self._ble_device,
+                cached_services=self._cached_services,
+                ble_device_callback=lambda: self._device,
             )
-            _LOGGER.debug("%s: Established connection; RSSI: %s", self.name, self.rssi)
-            # await client.pair()
-            _LOGGER.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
-            # services = client.services
-            # for service in services:
-            #    _LOGGER.debug("%s:service: %s", self.name, service.uuid)
-            #    characteristics = service.characteristics
-            #    for char in characteristics:
-            #        _LOGGER.debug("%s:characteristic: %s", self.name, char.uuid)
-            # resolved = self._resolve_characteristics(client.services)
-            # if not resolved:
-            #    # Try to handle services failing to load
-            #    resolved = self._resolve_characteristics(await client.get_services())
+            LOGGER.debug("%s: Connected", self.name)
+            resolved = self._resolve_characteristics(client.services)
+            if not resolved:
+                # Try to handle services failing to load
+                resolved = self._resolve_characteristics(await client.get_services())
+            self._cached_services = client.services if resolved else None
 
             self._client = client
-            self._disconnect_reason = None
             self._reset_disconnect_timer()
 
-            # _LOGGER.debug(
-            #    "%s: Subscribe to notifications; RSSI: %s", self.name, self.rssi
-            # )
-            # await client.start_notify(
-            #    CHARACTERISTIC_UUID_TO_SERVER, self._notification_handler
-            # )
-            # await client.start_notify(
-            #    CHARACTERISTIC_UUID_FROM_SERVER, self._notification_handler
-            # )
+            # Subscribe to notification is needed for LEDnetWF devices to accept commands
+            self._notification_callback = self._notification_handler
+            await client.start_notify(self._read_uuid, self._notification_callback)
+            LOGGER.debug("%s: Subscribed to notifications", self.name)
 
-    def _raise_if_not_connected(self) -> None:
-        """Raise if the connection to device is lost. Also reset the disconnect timer."""
-        if self._client and self._client.is_connected:
-            self._reset_disconnect_timer()
-            return
-        raise NotConnected
+    def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
+        """Resolve characteristics."""
+        for characteristic in NOTIFY_CHARACTERISTIC_UUIDS:
+            if char := services.get_characteristic(characteristic):
+                self._read_uuid = char
+                LOGGER.debug("%s: Read UUID: %s", self.name, self._read_uuid)
+                break
+        for characteristic in WRITE_CMD_CHARACTERISTIC_UUIDS:
+            if char := services.get_characteristic(characteristic):
+                self._write_uuid = char
+                LOGGER.debug("%s: Write UUID: %s", self.name, self._write_uuid)
+                break
+        for characteristic in WRITE_COL_CHARACTERISTIC_UUIDS:
+            if char := services.get_characteristic(characteristic):
+                self._write_colour_uuid = char
+                LOGGER.debug(
+                    "%s: Write colour UUID: %s", self.name, self._write_colour_uuid
+                )
+                break
+        return bool(self._read_uuid and self._write_uuid and self._write_colour_uuid)
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
-        _LOGGER.debug("%s: %s", self.name, inspect.currentframe().f_code.co_name)
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
         self._expected_disconnect = False
-        self._disconnect_timer = self.loop.call_later(
-            DISCONNECT_DELAY, self._timed_disconnect
-        )
+        if self._delay is not None and self._delay != 0:
+            LOGGER.debug(
+                "%s: Configured disconnect from device in %s seconds",
+                self.name,
+                self._delay,
+            )
+            self._disconnect_timer = self.loop.call_later(self._delay, self._disconnect)
 
-    def _disconnected(self, client: BleakClient) -> None:
+    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
         if self._expected_disconnect:
-            _LOGGER.info("%s: Disconnected from device; RSSI: %s", self.name, self.rssi)
+            LOGGER.debug("%s: Disconnected from device", self.name)
             return
-        _LOGGER.warning(
-            "%s: Device unexpectedly disconnected; RSSI: %s",
-            self.name,
-            self.rssi,
-        )
-        self._client = None
-        self._disconnect(DisconnectReason.UNEXPECTED)
+        LOGGER.warning("%s: Device unexpectedly disconnected", self.name)
 
-    def _timed_disconnect(self) -> None:
+    def _disconnect(self) -> None:
         """Disconnect from device."""
         self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())  # noqa: RUF006
+        asyncio.create_task(self._execute_timed_disconnect())
+
+    async def stop(self) -> None:
+        """Stop the LEDBLE."""
+        LOGGER.debug("%s: Stop", self.name)
+        await self._execute_disconnect()
 
     async def _execute_timed_disconnect(self) -> None:
         """Execute timed disconnection."""
-        _LOGGER.debug(
-            "%s: Disconnecting after timeout of %s",
-            self.name,
-            DISCONNECT_DELAY,
-        )
-        await self._execute_disconnect(DisconnectReason.TIMEOUT)
+        LOGGER.debug("%s: Disconnecting after timeout of %s", self.name, self._delay)
+        await self._execute_disconnect()
 
-    def _disconnect(self, reason: DisconnectReason) -> None:
-        """Disconnect from device."""
-        _LOGGER.debug("%s: %s", self.name, inspect.currentframe().f_code.co_name)
-        asyncio.create_task(self._execute_disconnect(reason))  # noqa: RUF006
-
-    async def _execute_disconnect(self, reason: DisconnectReason) -> None:
+    async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
-        _LOGGER.debug("%s: Execute disconnect", self.name)
-        if self._connect_lock.locked():
-            _LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete; "
-                "RSSI: %s",
-                self.name,
-                self.rssi,
-            )
         async with self._connect_lock:
+            read_char = self._read_uuid
             client = self._client
+            self._expected_disconnect = True
             self._client = None
+            self._write_uuid = None
+            self._read_uuid = None
             if client and client.is_connected:
-                self._expected_disconnect = True
-                # await client.stop_notify(CHARACTERISTIC_UUID_TO_SERVER)
-                # await client.stop_notify(CHARACTERISTIC_UUID_FROM_SERVER)
+                await client.stop_notify(
+                    read_char
+                )  #  TODO:  I don't think this is needed.  Bleak docs say it isnt.
                 await client.disconnect()
-            self._reset(reason)
-        _LOGGER.debug("%s: Execute disconnect done", self.name)
+            LOGGER.debug("%s: Disconnected", self.name)
 
-    def _reset(self, reason: DisconnectReason) -> None:
-        """Reset."""
-        _LOGGER.debug("%s: reset", self.name)
-        self._disconnect_reason = reason
-        if self._disconnect_timer:
-            self._disconnect_timer.cancel()
-        self._disconnect_timer = None
-
-    async def turn_on(self, brightness: int) -> None:
-        """Turn on the light."""
-        _LOGGER.debug("%s: Turn on (%s)", self.name, brightness)
-
-    async def turn_off(self) -> None:
-        """Turn off the light."""
-        _LOGGER.debug("%s: Turn off", self.name)
-
-    def is_on(self) -> bool:
-        """Is On."""
-        _LOGGER.debug("%s: Is On", self.name)
-        return True
+    def local_callback(self):
+        # Placeholder to be replaced by a call from light.py
+        # I can't work out how to plumb a callback from here to light.py
+        return
