@@ -86,7 +86,7 @@ WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 
 def bytearray_to_hex_format(byte_array):
-    hex_strings = [f"0x{byte:02x}" for byte in byte_array]
+    hex_strings = [f"{byte:02x}" for byte in byte_array]
     return hex_strings
 
 
@@ -207,6 +207,10 @@ class IDEALLEDInstance:
         await self._ensure_connected()
         cipher = AES.new(SECRET_ENCRYPTION_KEY, AES.MODE_ECB)
         ciphered_data = cipher.encrypt(data)
+        LOGGER.debug(f"Writing data to {self.name}: {bytearray_to_hex_format(data)}")
+        LOGGER.debug(
+            f"Writing encrypted data to {self.name}: {bytearray_to_hex_format(ciphered_data)}"
+        )
         await self._write_while_connected(ciphered_data)
 
     async def _write_colour_data(self, data: bytearray):
@@ -215,11 +219,12 @@ class IDEALLEDInstance:
         await self._write_colour_while_connected(data)
 
     async def _write_while_connected(self, data: bytearray):
-        LOGGER.debug(f"Writing data to {self.name}: {data}")
         await self._client.write_gatt_char(self._write_uuid, data, False)
 
     async def _write_colour_while_connected(self, data: bytearray):
-        LOGGER.debug(f"Writing colour data to {self.name}: {data}")
+        LOGGER.debug(
+            f"Writing colour data to {self.name}: {bytearray_to_hex_format(data)}"
+        )
         await self._client.write_gatt_char(self._write_colour_uuid, data, False)
 
     def _notification_handler(
@@ -275,6 +280,7 @@ class IDEALLEDInstance:
         return self._color_mode
 
     async def set_brightness(self, brightness: int):
+        return
         LOGGER.info("Brightness only: " + str(brightness))
         if brightness == self._brightness:
             return
@@ -370,13 +376,13 @@ class IDEALLEDInstance:
 
     @retry_bluetooth_connection_error
     async def turn_on(self):
-        packet = bytearray.fromhex("05 54 55 52 4E 01 00 00 00 00 00 00 00 00 00 00")
+        packet = bytearray([6, 76, 69, 68, 79, 78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         await self._write(packet)
         self._is_on = True
 
     @retry_bluetooth_connection_error
     async def turn_off(self):
-        packet = bytearray.fromhex("05 54 55 52 4E 00 00 00 00 00 00 00 00 00 00 00")
+        packet = bytearray([6, 76, 69, 68, 79, 70, 70, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         await self._write(packet)
         self._is_on = False
 
