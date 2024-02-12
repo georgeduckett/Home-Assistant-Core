@@ -1,110 +1,155 @@
-"""Platform for light integration."""
-from __future__ import annotations
-
 import logging
-from typing import Any
+from typing import Any, Optional
 
-from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode, LightEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+import voluptuous as vol
 
-# Import the device class from the component that you want to support
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_EFFECT,
+    ATTR_RGB_COLOR,
+    PLATFORM_SCHEMA,
+    ColorMode,
+    LightEntity,
+    LightEntityFeature,
+)
+from homeassistant.const import CONF_MAC
+from homeassistant.helpers import device_registry
+import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.entity import DeviceInfo
 
 from .const import DOMAIN
-from .iDealLed import IdealLedData, iDealLed
-from .models import DeviceInfo
+from .idealled import IDEALLEDInstance
 
-_LOGGER = logging.getLogger(__name__)
-
-
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the lock platform for Dormakaba dKey."""
-    data: IdealLedData = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([iDealLedLight(data.coordinator, data.lock)])
+LOGGER = logging.getLogger(__name__)
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({vol.Required(CONF_MAC): cv.string})
 
 
-class iDealLedLight(LightEntity):
-    """Representation of an iDealLed as a single light."""
+async def async_setup_entry(hass, config_entry, async_add_devices):
+    instance = hass.data[DOMAIN][config_entry.entry_id]
+    await instance.update()
+    async_add_devices(
+        [IDEALLEDLight(instance, config_entry.data["name"], config_entry.entry_id)]
+    )
+    # config_entry.async_on_unload(await instance.stop())
 
-    _attr_color_mode = ColorMode.RGB
-    _attr_supported_color_modes = {ColorMode.RGB}
 
+class IDEALLEDLight(LightEntity):
     def __init__(
-        self, coordinator: DataUpdateCoordinator[None], iDealLedDevice: iDealLed
+        self, idealledinstance: IDEALLEDInstance, name: str, entry_id: str
     ) -> None:
-        """Initialize."""
-        self._light = iDealLedDevice
-        self._name = iDealLedDevice.name
-        self._state = None
-        self._brightness = None
+        self._instance = idealledinstance
+        self._entry_id = entry_id
+        self._attr_supported_color_modes = {ColorMode.RGB}
+        self._attr_supported_features = (
+            LightEntityFeature.EFFECT | LightEntityFeature.FLASH
+        )
+        self._attr_brightness_step_pct = 10
+        self._attr_name = name
+        self._attr_unique_id = self._instance.mac
+        self._instance.local_callback = self.light_local_callback
 
     @property
-    def device_info(self) -> DeviceInfo:
-        """Return the device info."""
+    def available(self):
+        return self._instance.is_on != None
+
+    @property
+    def brightness(self):
+        return self._instance.brightness
+
+    @property
+    def brightness_step_pct(self):
+        return self._attr_brightness_step_pct
+
+    @property
+    def is_on(self) -> Optional[bool]:
+        return self._instance.is_on
+
+    @property
+    def effect_list(self):
+        return self._instance.effect_list
+
+    @property
+    def effect(self):
+        return self._instance._effect
+
+    @property
+    def supported_features(self) -> int:
+        """Flag supported features."""
+        return self._attr_supported_features
+
+    @property
+    def supported_color_modes(self) -> int:
+        """Flag supported color modes."""
+        return self._attr_supported_color_modes
+
+    @property
+    def rgb_color(self):
+        """Return the hs color value."""
+        return self._instance.rgb_color
+
+    @property
+    def color_mode(self):
+        """Return the color mode of the light."""
+        return self._instance._color_mode
+
+    @property
+    def device_info(self):
+        """Return device info."""
         return DeviceInfo(
             identifiers={
                 # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.name)
+                (DOMAIN, self._instance.mac)
             },
             name=self.name,
-            device_id=self.name,
-            model=self.light.productname,
-            # TODO: Get other properties if we can
+            connections={(device_registry.CONNECTION_NETWORK_MAC, self._instance.mac)},
         )
 
     @property
-    def name(self) -> str:
-        """Return the display name of this light."""
-        return self._name
-
-    @property
-    def brightness(self) -> int | None:
-        """Brightness."""
-        return self._brightness
-
-    @property
-    def color_mode(self) -> ColorMode | None:
-        """Color Mode."""
-        return ColorMode.RGB
-
-    @property
-    def supported_color_modes(self) -> set[ColorMode] | set[str] | None:
-        """Supported Color Modes."""
-        return ColorMode.RGB
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return true if light is on."""
-        return self._state
+    def should_poll(self):
+        return False
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Instruct the light to turn on.
+        LOGGER.info("Turn on called.  kwargs: " + str(kwargs))
+        if not self.is_on:
+            await self._instance.turn_on()
 
-        You can skip the brightness part if your light does not support
-        brightness control.
-        """
-        self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-        await self._light.turn_on(self._brightness)
-        self._state = True
+        if ATTR_BRIGHTNESS in kwargs and len(kwargs) == 1:
+            # Only brightness changed
+            await self._instance.set_brightness(kwargs[ATTR_BRIGHTNESS])
+
+        if ATTR_RGB_COLOR in kwargs:
+            if kwargs[ATTR_RGB_COLOR] != self.rgb_color:
+                self._effect = None
+                bri = (
+                    kwargs[ATTR_BRIGHTNESS]
+                    if ATTR_BRIGHTNESS in kwargs
+                    else self._instance._brightness
+                )
+                await self._instance.set_rgb_color(kwargs[ATTR_RGB_COLOR], bri)
+
+        if ATTR_EFFECT in kwargs:
+            if kwargs[ATTR_EFFECT] != self.effect:
+                self._effect = kwargs[ATTR_EFFECT]
+                bri = (
+                    kwargs[ATTR_BRIGHTNESS]
+                    if ATTR_BRIGHTNESS in kwargs
+                    else self._instance._brightness
+                )
+                await self._instance.set_effect(kwargs[ATTR_EFFECT], bri)
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Instruct the light to turn off."""
-        await self._light.turn_off()
-        self._state = False
+        await self._instance.turn_off()
+        self.async_write_ha_state()
 
     async def async_update(self) -> None:
-        """Fetch new state data for this light.
+        LOGGER.debug("async update called")
+        await self._instance.update()
+        self.async_write_ha_state()
 
-        This is the only method that should fetch new data for Home Assistant.
-        """
-        # await self._light.update()
-        if self._state is None:
-            self._state = self._light.is_on()
-        # TODO Figure out if there's a way to get the state of the lights
-        # self._brightness = self._light.brightness
+    def light_local_callback(self):
+        self.async_write_ha_state()
+
+    async def update_ha_state(self) -> None:
+        await self._instance.update()
+        self.async_write_ha_state()
