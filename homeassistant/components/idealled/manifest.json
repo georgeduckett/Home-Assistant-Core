@@ -1,6 +1,6 @@
 {
-  "domain": "ideal_ledtest",
-  "name": "iDeal Led TEST",
+  "domain": "idealled",
+  "name": "iDeal Led",
   "bluetooth": [
       { "local_name": "IDL-*" }
     ],
@@ -8,7 +8,7 @@
   "config_flow": true,
   "dependencies": ["bluetooth"],
   "iot_class": "local_polling",
-  "requirements": ["bleak-retry-connector>=1.17.1","bleak>=0.17.0"],
+  "requirements": ["bleak-retry-connector>=1.17.1","bleak>=0.17.0","pycryptodome","bluetooth_sensor_state_data"],
   "version": "0.0.1",
   "integration_type": "device"
 }

@@ -1,3 +1,4 @@
-DOMAIN = "ideal_ledtest"
+"""Constants used by this module."""
+DOMAIN = "idealled"
 CONF_RESET = "reset"
 CONF_DELAY = "delay"

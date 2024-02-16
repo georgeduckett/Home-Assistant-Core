@@ -1,3 +1,4 @@
+"""Initialise this module."""
 from __future__ import annotations
 
 import logging
@@ -10,7 +11,7 @@ from .const import CONF_DELAY, CONF_RESET, DOMAIN
 from .idealled import IDEALLEDInstance
 
 LOGGER = logging.getLogger(__name__)
-PLATFORMS = ["light"]
+PLATFORMS = ["light", "number"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -1,9 +1,9 @@
+"""The iDealLED device."""
 import asyncio
 from collections.abc import Callable
-import colorsys
 import logging
 import traceback
-from typing import Any, Tuple, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTCharacteristic, BleakGATTServiceCollection
@@ -19,6 +19,7 @@ from Crypto.Cipher import AES
 # from datetime import datetime
 from homeassistant.components import bluetooth
 from homeassistant.components.light import ColorMode
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
 # Add effects information in a separate file because there is a LOT of boilerplate.
@@ -33,8 +34,10 @@ EFFECT_05 = "Effect 05"
 EFFECT_06 = "Effect 06"
 EFFECT_07 = "Effect 07"
 EFFECT_08 = "Effect 08"
-EFFECT_09 = "Effect 09"
+EFFECT_09 = "Effect 09"  # What's up with this one?
 EFFECT_10 = "Effect 10"
+EFFECT_11 = "Effect 11"
+EFFECT_MICROPHONE = "Microphone"
 
 EFFECT_MAP = {
     EFFECT_01: 1,
@@ -47,6 +50,8 @@ EFFECT_MAP = {
     EFFECT_08: 8,
     EFFECT_09: 9,
     EFFECT_10: 10,
+    EFFECT_11: 11,
+    EFFECT_MICROPHONE: 12,
 }
 
 EFFECT_LIST = sorted(EFFECT_MAP)
@@ -86,14 +91,18 @@ WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 
 def bytearray_to_hex_format(byte_array):
+    """Convert a byte array to a hex string."""
     hex_strings = [f"{byte:02x}" for byte in byte_array]
     return hex_strings
 
 
 def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
+    """Retry the given function upon a bluetooth error."""
+
     async def _async_wrap_retry_bluetooth_connection_error(
         self: "IDEALLEDInstance", *args: Any, **kwargs: Any
     ) -> Any:
+        """Perform the retry."""
         attempts = DEFAULT_ATTEMPTS
         max_attempts = attempts - 1
 
@@ -117,7 +126,7 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                     )
                     raise
                 LOGGER.debug(
-                    "%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",
+                    "%s: %s error calling %s, backing off %ss, retrying (%s/%s)",
                     self.name,
                     type(err),
                     func,
@@ -155,7 +164,18 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
 
 
 class IDEALLEDInstance:
-    def __init__(self, address, reset: bool, delay: int, hass) -> None:
+    """A class representing the iDeal LED device."""
+
+    def __init__(self, address, reset: bool, delay: int, hass: HomeAssistant) -> None:
+        """Initialise the class."""
+        self._startmiccommand = bytearray(
+            [6, 77, 73, 67, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        )
+        self._stopmiccommand = bytearray(
+            [6, 77, 73, 67, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        )
+        self._usingmic = False
+
         self.loop = asyncio.get_running_loop()
         self._mac = address
         self._reset = reset
@@ -173,7 +193,7 @@ class IDEALLEDInstance:
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
         self._is_on = None
-        self._rgb_color = (255, 0, 0)
+        self._rgb_color = (255, 255, 255)
         self._brightness = 255
         self._effect = None
         self._effect_speed = 0x64
@@ -185,6 +205,8 @@ class IDEALLEDInstance:
         self._turn_off_cmd = None
         self._model = self._detect_model()
         self._on_update_callbacks = []
+        self._notification_callback = None
+        self._disconnecttask = None
 
         LOGGER.debug(
             "Model information for device %s : ModelNo %s. MAC: %s",
@@ -196,9 +218,7 @@ class IDEALLEDInstance:
     def _detect_model(self):
         x = 0
         for name in NAME_ARRAY:
-            if self._device.name.lower().startswith(
-                name.lower()
-            ):  # TODO: match on BLE provided model instead of name
+            if self._device.name.lower().startswith(name.lower()):
                 return x
             x = x + 1
 
@@ -207,9 +227,11 @@ class IDEALLEDInstance:
         await self._ensure_connected()
         cipher = AES.new(SECRET_ENCRYPTION_KEY, AES.MODE_ECB)
         ciphered_data = cipher.encrypt(data)
-        LOGGER.debug(f"Writing data to {self.name}: {bytearray_to_hex_format(data)}")
+        LOGGER.debug("Writing data to %s: %s", self.name, bytearray_to_hex_format(data))
         LOGGER.debug(
-            f"Writing encrypted data to {self.name}: {bytearray_to_hex_format(ciphered_data)}"
+            "Writing encrypted data to %s: %s",
+            self.name,
+            bytearray_to_hex_format(ciphered_data),
         )
         await self._write_while_connected(ciphered_data)
 
@@ -223,7 +245,7 @@ class IDEALLEDInstance:
 
     async def _write_colour_while_connected(self, data: bytearray):
         LOGGER.debug(
-            f"Writing colour data to {self.name}: {bytearray_to_hex_format(data)}"
+            "Writing colour data to %s: %s", self.name, bytearray_to_hex_format(data)
         )
         await self._client.write_gatt_char(self._write_colour_uuid, data, False)
 
@@ -235,66 +257,107 @@ class IDEALLEDInstance:
         cipher = AES.new(SECRET_ENCRYPTION_KEY, AES.MODE_ECB)
         clear_data = cipher.decrypt(data)
         LOGGER.debug(
-            f"BLE Notification: {self.name}: {bytearray_to_hex_format(clear_data)}"
+            "BLE Notification: %s: %s", self.name, bytearray_to_hex_format(clear_data)
         )
         # self.local_callback()
 
     @property
     def mac(self):
+        """The device's mac address."""
         return self._device.address
 
     @property
     def reset(self):
+        """Whether this device is reset."""
         return self._reset
 
     @property
     def name(self):
+        """The name of this device."""
         return self._device.name
 
     @property
     def rssi(self):
+        """The rssi of this device."""
         return self._device.rssi
 
     @property
     def is_on(self):
+        """Whether this device is on."""
         return self._is_on
 
     @property
     def brightness(self):
+        """The brightness of this device."""
         return self._brightness
 
     @property
     def rgb_color(self):
+        """The colour of this device, when set to a single colour."""
         return self._rgb_color
 
     @property
     def effect_list(self) -> list[str]:
+        """The list of effects supported by this device."""
         return EFFECT_LIST
 
     @property
     def effect(self):
+        """The current effect."""
         return self._effect
 
     @property
     def color_mode(self):
+        """The current colour mode."""
         return self._color_mode
 
+    async def set_speed(self, speed: int):
+        """Set the effect speed of this device."""
+        speed = min(speed, 100)
+        if speed == self._effect_speed:
+            return
+        self._effect_speed = speed
+        packet = bytearray([6, 83, 80, 69, 69, 68, speed, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        await self._write(packet)
+
     async def set_brightness(self, brightness: int):
-        return
-        LOGGER.info("Brightness only: " + str(brightness))
+        """Set the brightness of this device."""
+        brightness = min(brightness, 255)
         if brightness == self._brightness:
             return
-        else:
-            self._brightness = brightness
-            if self._effect is not None:
-                await self.set_effect(self._effect, self._brightness)
-            else:
-                await self.set_rgb_color(self._rgb_color, self._brightness)
+        self._brightness = brightness
+        brightness_percent = int(brightness * 100 / 255)
+        packet = bytearray(
+            [
+                6,
+                76,
+                73,
+                71,
+                72,
+                84,
+                max(3, brightness_percent),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        )
+        await self._write(packet)
 
     @retry_bluetooth_connection_error
     async def set_rgb_color(
-        self, rgb: Tuple[int, int, int], brightness: int | None = None
+        self, rgb: tuple[int, int, int], brightness: int | None = None
     ):
+        """Set the colour of this device."""
+        if self._usingmic:
+            self._usingmic = False
+            await self._write(self._stopmiccommand)
+
         if None in rgb:
             rgb = self._rgb_color
         self._rgb_color = rgb
@@ -310,15 +373,12 @@ class IDEALLEDInstance:
         red = int(rgb[0] * brightness_percent / 100)
         green = int(rgb[1] * brightness_percent / 100)
         blue = int(rgb[2] * brightness_percent / 100)
-        # RGB packet
-        # rgb_packet = bytearray.fromhex(
-        #    "0F 53 47 4C 53 00 00 64 50 1F 00 00 1F 00 00 32"
-        # )
+
         red = int(
-            red >> 3
-        )  # You CAN send 8 bit colours to this thing, but you probably shouldn't for power reasons.  Thanks to the good folks at Hacker News for that insight.
-        green = int(green >> 3)
-        blue = int(blue >> 3)
+            red >> 1
+        )  # You CAN send 8 bit colours to this thing, but you probably shouldn't for power reasons.  Thanks to the good folks at Hacker News for that insight. (used to shift 3, now just 1)
+        green = int(green >> 1)
+        blue = int(blue >> 1)
         rgb_packet = bytearray(
             [7, 67, 79, 76, 79, green, red, blue, 0, 0, 0, 0, 0, 0, 0, 0]
         )
@@ -327,71 +387,114 @@ class IDEALLEDInstance:
     @retry_bluetooth_connection_error
     # effect, reverse=0, speed=50, saturation=50, colour_data=COLOUR_DATA
     async def set_effect(self, effect: str, brightness: int | None = NotImplemented):
-        return
+        """Set the effect of this device."""
         if effect not in EFFECT_LIST:
             LOGGER.error("Effect %s not supported", effect)
             return
         self._effect = effect
-        self._color_mode = None
-        effect_id = EFFECT_MAP.get(effect)
-        if effect_id > 11:
-            effect = 11
-        brightness_pct = int(brightness * 100 / 255)
-        packet = bytearray.fromhex("0A 4D 55 4C 54 08 00 64 50 07 32 00 00 00 00 00")
-        packet[5] = effect_id
-        packet[6] = 0  # reverse
-        packet[8] = 50  # speed
-        packet[10] = 100  # brightness_pct # 50 # saturation (brightness?)
-        await self._write(packet)
-        # Now we send the colour data
-        await self.write_colour_data()
+        self._color_mode = ColorMode.BRIGHTNESS
 
-    @retry_bluetooth_connection_error
-    async def write_colour_data(self):
-        return
-        # This is sent after switching to an effect to tell the device what sort of pattern to show.
-        # In the app you can edit this yourself, but HA doesn't have the UI for such a thing
-        # so for now I'm just going to hardcode it to a rainbow pattern.  You could change this to
-        # whatever you want, but for an effect the maximum length is 7 colours.
-        brightness_pct = int(self._brightness * 100 / 255)
-        colour_list = []
-        colour_divisions = int(360 / 7)
-        for i in range(7):
-            h = i * colour_divisions
-            r, g, b = colorsys.hsv_to_rgb(h / 360, 1, brightness_pct / 100.0)
-            r = int(r * 255)
-            g = int(g * 255)
-            b = int(b * 255)
-            colour_list.append((r, g, b))
-        # print(f"Colour list: {colour_list}")
-        length = len(colour_list)
-        colour_data = []
-        colour_data.append(length * 3)  # 3 bytes per colour
-        colour_data.append(0)  # Don't know what this is, perhaps just a separator
-        for colour in colour_list:
-            colour_data.append(colour[0])
-            colour_data.append(colour[1])
-            colour_data.append(colour[2])
-        await self._write_colour_data(colour_data)
+        if effect == EFFECT_MICROPHONE:
+            self._usingmic = True
+            await self._write(self._startmiccommand)
+            return
+
+        effect_id = EFFECT_MAP.get(effect)
+        effect_id = min(
+            effect_id, 11
+        )  # IMPORTANT, ENSURE NO EFFECT ID MORE THAN 11 IS CHOSEN SINCE THAT MAY BRICK THE DEVICE
+        brightness_pct = int(brightness * 100 / 255)
+        # (14, 69, 70, 70) = effect header | effect id | 7 colours | colour array index? | the colours (g,r,b)
+        packet = bytearray(
+            [
+                14,
+                69,
+                70,
+                70,
+                effect_id,
+                7,
+                3,
+                0,
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+                int(int(128 * brightness_pct / 100) >> 1),
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+                int(int(255 * brightness_pct / 100) >> 1),
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+            ]
+        )
+        await self._write(packet)
+        packet = bytearray(
+            [
+                14,
+                69,
+                70,
+                70,
+                effect_id,
+                7,
+                19,
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+                0,
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+                0,
+                int(int(255 * brightness_pct / 100) >> 1),
+            ]
+        )
+        await self._write(packet)
+        packet = bytearray(
+            [
+                14,
+                69,
+                70,
+                70,
+                effect_id,
+                7,
+                33,
+                int(int(128 * brightness_pct / 100) >> 1),
+                0,
+                int(int(255 * brightness_pct / 100) >> 1),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        )
+        await self._write(packet)
 
     @retry_bluetooth_connection_error
     async def turn_on(self):
+        """Turn on this device."""
         packet = bytearray([6, 76, 69, 68, 79, 78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         await self._write(packet)
         self._is_on = True
+        if self._usingmic:
+            await self._write(self._startmiccommand)
 
     @retry_bluetooth_connection_error
     async def turn_off(self):
+        """Turn off this device."""
+        if self._usingmic:
+            # Stop the mic, but say we're still ising it so it starts it again when we turn back on
+            await self._write(self._stopmiccommand)
         packet = bytearray([6, 76, 69, 68, 79, 70, 70, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         await self._write(packet)
         self._is_on = False
 
     @retry_bluetooth_connection_error
     async def update(self):
+        """Update this device."""
         LOGGER.debug("%s: Update in lwdnetwf called", self.name)
         try:
             await self._ensure_connected()
-            self._is_on = False
+            self._is_on = True  # Assume on
         except Exception as error:
             self._is_on = None  # failed to connect, this should mark it as unavailable
             LOGGER.error("Error getting status: %s", error)
@@ -481,7 +584,7 @@ class IDEALLEDInstance:
     def _disconnect(self) -> None:
         """Disconnect from device."""
         self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
+        self._disconnecttask = asyncio.create_task(self._execute_timed_disconnect())
 
     async def stop(self) -> None:
         """Stop the LEDBLE."""
@@ -503,13 +606,12 @@ class IDEALLEDInstance:
             self._write_uuid = None
             self._read_uuid = None
             if client and client.is_connected:
-                await client.stop_notify(
-                    read_char
-                )  #  TODO:  I don't think this is needed.  Bleak docs say it isnt.
+                await client.stop_notify(read_char)
                 await client.disconnect()
             LOGGER.debug("%s: Disconnected", self.name)
 
     def local_callback(self):
+        """Just return for now."""
         # Placeholder to be replaced by a call from light.py
         # I can't work out how to plumb a callback from here to light.py
         return
