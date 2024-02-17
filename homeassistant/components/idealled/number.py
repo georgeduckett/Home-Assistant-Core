@@ -2,6 +2,7 @@
 import logging
 
 from homeassistant.components.number import NumberEntity
+from homeassistant.components.number.const import NumberDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
@@ -10,7 +11,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .idealled import IDEALLEDInstance
-from .number import NumberDeviceClass
 
 LOGGER = logging.getLogger(__name__)
 

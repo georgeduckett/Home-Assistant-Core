@@ -37,9 +37,187 @@ async def async_setup_entry(
     instance = hass.data[DOMAIN][config_entry.entry_id]
     await instance.update()
     async_add_entities(
-        [IDEALLEDLight(instance, config_entry.data["name"], config_entry.entry_id)]
+        [
+            IDEALLEDLight(instance, config_entry.data["name"], config_entry.entry_id),
+            EffectColourLight(
+                instance,
+                0,
+                config_entry.data["name"] + " Effect Color 1",
+                config_entry.entry_id + "_effect_color_1",
+            ),
+            EffectColourLight(
+                instance,
+                1,
+                config_entry.data["name"] + " Effect Color 2",
+                config_entry.entry_id + "_effect_color_2",
+            ),
+            EffectColourLight(
+                instance,
+                2,
+                config_entry.data["name"] + " Effect Color 3",
+                config_entry.entry_id + "_effect_color_3",
+            ),
+            EffectColourLight(
+                instance,
+                3,
+                config_entry.data["name"] + " Effect Color 4",
+                config_entry.entry_id + "_effect_color_4",
+            ),
+            EffectColourLight(
+                instance,
+                4,
+                config_entry.data["name"] + " Effect Color 5",
+                config_entry.entry_id + "_effect_color_5",
+            ),
+            EffectColourLight(
+                instance,
+                5,
+                config_entry.data["name"] + " Effect Color 6",
+                config_entry.entry_id + "_effect_color_6",
+            ),
+            EffectColourLight(
+                instance,
+                6,
+                config_entry.data["name"] + " Effect Color 7",
+                config_entry.entry_id + "_effect_color_7",
+            ),
+        ]
     )
     # config_entry.async_on_unload(await instance.stop())
+
+
+class EffectColourLight(LightEntity):
+    """A class representing a single colour that the effects use."""
+
+    def __init__(
+        self,
+        idealledinstance: IDEALLEDInstance,
+        effect_colour_index: int,
+        name: str,
+        entry_id: str,
+    ) -> None:
+        """Initialise the class."""
+        self._instance = idealledinstance
+        self._effect_colour_index = effect_colour_index
+        self._entry_id = entry_id
+        self._attr_supported_color_modes = {ColorMode.RGB}
+        self._attr_supported_features = LightEntityFeature.EFFECT
+        self._attr_brightness_step_pct = 10
+        self._attr_name = name
+        self._attr_unique_id = (
+            self._instance.mac + "_effect_color_" + str(effect_colour_index)
+        )
+        self._instance.local_callback = self.light_local_callback
+        self._rgb_color = (255, 255, 255)
+        self._brightness = None
+        self._is_on = True
+
+    @property
+    def available(self) -> bool:
+        """Determines whether the light is avaialable."""
+        return self._instance.is_on is not None
+
+    @property
+    def brightness(self) -> int:
+        """The brightness."""
+        return self._brightness
+
+    @property
+    def brightness_step_pct(self):
+        """The amout the brightness changes by."""
+        return self._attr_brightness_step_pct
+
+    @property
+    def is_on(self) -> bool | None:
+        """Whether the LEDs are on."""
+        return self._is_on
+
+    @property
+    def supported_features(self) -> LightEntityFeature:
+        """Flag supported features."""
+        return self._attr_supported_features
+
+    @property
+    def supported_color_modes(self) -> set[ColorMode]:
+        """Flag supported color modes."""
+        return self._attr_supported_color_modes
+
+    @property
+    def rgb_color(self) -> tuple[int, int, int]:
+        """Return the hs color value."""
+        return self._rgb_color
+
+    @property
+    def color_mode(self) -> ColorMode:
+        """Return the color mode of the light."""
+        return ColorMode.RGB
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device info."""
+        return DeviceInfo(
+            identifiers={
+                # Serial numbers are unique identifiers within a specific domain
+                (DOMAIN, self._instance.mac)
+            },
+            name=self.name,
+            connections={(dr.CONNECTION_NETWORK_MAC, self._instance.mac)},
+        )
+
+    @property
+    def should_poll(self) -> bool:
+        """We shouldn't poll since it can't provide updates."""
+        return False
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the light on."""
+        LOGGER.info("Turn on called.  kwargs: %s", str(kwargs))
+        self._is_on = True
+
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = kwargs[ATTR_BRIGHTNESS]
+
+        if ATTR_RGB_COLOR in kwargs:
+            self._rgb_color = (
+                kwargs[ATTR_RGB_COLOR][0],
+                kwargs[ATTR_RGB_COLOR][1],
+                kwargs[ATTR_RGB_COLOR][2],
+            )
+
+        if self._brightness is None:
+            self._brightness = 255
+        brightness_percent = int(self._brightness * 100 / 255)
+
+        # Now adjust the RBG values to match the brightness
+        red = int(self._rgb_color[0] * brightness_percent / 100)
+        green = int(self._rgb_color[1] * brightness_percent / 100)
+        blue = int(self._rgb_color[2] * brightness_percent / 100)
+        await self._instance.set_effect_colour(
+            self._effect_colour_index, (red, green, blue)
+        )
+
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the light off."""
+        self._is_on = False
+        await self._instance.set_effect_colour(self._effect_colour_index, (0, 0, 0))
+        self.async_write_ha_state()
+
+    async def async_update(self) -> None:
+        """Update the entity."""
+        LOGGER.debug("async update called")
+        await self._instance.update()
+        self.async_write_ha_state()
+
+    def light_local_callback(self):
+        """Perform the callback."""
+        self.async_write_ha_state()
+
+    async def update_ha_state(self) -> None:
+        """Update HA state."""
+        await self._instance.update()
+        self.async_write_ha_state()
 
 
 class IDEALLEDLight(
@@ -55,9 +233,7 @@ class IDEALLEDLight(
         self._entry_id = entry_id
         self._effect = None
         self._attr_supported_color_modes = {ColorMode.RGB}
-        self._attr_supported_features = (
-            LightEntityFeature.EFFECT | LightEntityFeature.FLASH
-        )
+        self._attr_supported_features = LightEntityFeature.EFFECT
         self._attr_brightness_step_pct = 10
         self._attr_name = name
         self._attr_unique_id = self._instance.mac

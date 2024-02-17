@@ -207,6 +207,15 @@ class IDEALLEDInstance:
         self._on_update_callbacks = []
         self._notification_callback = None
         self._disconnecttask = None
+        self._effect_colors = [
+            (0, 255, 0),
+            (128, 255, 0),
+            (255, 255, 0),
+            (255, 0, 0),
+            (255, 0, 255),
+            (0, 0, 255),
+            (128, 0, 255),
+        ]
 
         LOGGER.debug(
             "Model information for device %s : ModelNo %s. MAC: %s",
@@ -292,6 +301,11 @@ class IDEALLEDInstance:
         return self._brightness
 
     @property
+    def effect_speed(self):
+        """The brightness of this device."""
+        return self._effect_speed
+
+    @property
     def rgb_color(self):
         """The colour of this device, when set to a single colour."""
         return self._rgb_color
@@ -305,6 +319,21 @@ class IDEALLEDInstance:
     def effect(self):
         """The current effect."""
         return self._effect
+
+    def effect_colour(self, index: int):
+        """Get the effect colour at the given index."""
+        return self._effect_colors[index]
+
+    async def set_effect_colour(self, index: int, colour):
+        """Set the effect colour at the given index."""
+        self._effect_colors[index] = colour
+        # if an effect (that's not the microphone) is happening then set that effect again to update the colours
+        if (
+            self._effect is not None
+            and self._effect != EFFECT_MICROPHONE
+            and self.is_on
+        ):
+            await self.set_effect(self._effect, self._brightness)
 
     @property
     def color_mode(self):
@@ -374,9 +403,8 @@ class IDEALLEDInstance:
         green = int(rgb[1] * brightness_percent / 100)
         blue = int(rgb[2] * brightness_percent / 100)
 
-        red = int(
-            red >> 1
-        )  # You CAN send 8 bit colours to this thing, but you probably shouldn't for power reasons.  Thanks to the good folks at Hacker News for that insight. (used to shift 3, now just 1)
+        # You CAN send 8 bit colours to this thing, but you probably shouldn't for power reasons.  Thanks to the good folks at Hacker News for that insight. (used to shift 3, now just 1)
+        red = int(red >> 1)
         green = int(green >> 1)
         blue = int(blue >> 1)
         rgb_packet = bytearray(
@@ -414,15 +442,15 @@ class IDEALLEDInstance:
                 effect_id,
                 7,
                 3,
-                0,
-                int(int(255 * brightness_pct / 100) >> 1),
-                0,
-                int(int(128 * brightness_pct / 100) >> 1),
-                int(int(255 * brightness_pct / 100) >> 1),
-                0,
-                int(int(255 * brightness_pct / 100) >> 1),
-                int(int(255 * brightness_pct / 100) >> 1),
-                0,
+                int(int(self._effect_colors[0][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[0][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[0][2] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[1][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[1][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[1][2] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[2][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[2][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[2][2] * brightness_pct / 100) >> 1),
             ]
         )
         await self._write(packet)
@@ -435,15 +463,15 @@ class IDEALLEDInstance:
                 effect_id,
                 7,
                 19,
-                int(int(255 * brightness_pct / 100) >> 1),
-                0,
-                0,
-                int(int(255 * brightness_pct / 100) >> 1),
-                0,
-                int(int(255 * brightness_pct / 100) >> 1),
-                0,
-                0,
-                int(int(255 * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[3][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[3][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[3][2] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[4][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[4][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[4][2] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[5][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[5][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[5][2] * brightness_pct / 100) >> 1),
             ]
         )
         await self._write(packet)
@@ -456,9 +484,9 @@ class IDEALLEDInstance:
                 effect_id,
                 7,
                 33,
-                int(int(128 * brightness_pct / 100) >> 1),
-                0,
-                int(int(255 * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[6][1] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[6][0] * brightness_pct / 100) >> 1),
+                int(int(self._effect_colors[6][2] * brightness_pct / 100) >> 1),
                 0,
                 0,
                 0,
