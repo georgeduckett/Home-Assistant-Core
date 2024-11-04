@@ -18,7 +18,6 @@ from Crypto.Cipher import AES
 
 # from datetime import datetime
 from homeassistant.components import bluetooth
-from homeassistant.components.light import ColorMode
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
@@ -197,7 +196,6 @@ class IDEALLEDInstance:
         self._brightness = 255
         self._effect = None
         self._effect_speed = 0x64
-        self._color_mode = ColorMode.RGB
         self._write_uuid = None
         self._write_colour_uuid = None
         self._read_uuid = None
@@ -335,11 +333,6 @@ class IDEALLEDInstance:
         ):
             await self.set_effect(self._effect, self._brightness)
 
-    @property
-    def color_mode(self):
-        """The current colour mode."""
-        return self._color_mode
-
     async def set_speed(self, speed: int):
         """Set the effect speed of this device."""
         speed = min(speed, 100)
@@ -391,7 +384,6 @@ class IDEALLEDInstance:
             rgb = self._rgb_color
         self._rgb_color = rgb
         self._effect = None
-        self._color_mode = ColorMode.RGB
         if brightness is None:
             if self._brightness is None:
                 self._brightness = 255
@@ -420,7 +412,6 @@ class IDEALLEDInstance:
             LOGGER.error("Effect %s not supported", effect)
             return
         self._effect = effect
-        self._color_mode = ColorMode.BRIGHTNESS
 
         if effect == EFFECT_MICROPHONE:
             self._usingmic = True

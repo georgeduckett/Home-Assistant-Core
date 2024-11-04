@@ -6,6 +6,7 @@ import voluptuous as vol
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_MODE,
     ATTR_EFFECT,
     ATTR_RGB_COLOR,
     PLATFORM_SCHEMA,
@@ -14,12 +15,13 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_MAC
+from homeassistant.const import CONF_MAC, STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN
 from .idealled import IDEALLEDInstance
@@ -86,7 +88,7 @@ async def async_setup_entry(
     # config_entry.async_on_unload(await instance.stop())
 
 
-class EffectColourLight(LightEntity):
+class EffectColourLight(LightEntity, RestoreEntity):
     """A class representing a single colour that the effects use."""
 
     def __init__(
@@ -108,9 +110,6 @@ class EffectColourLight(LightEntity):
             self._instance.mac + "_effect_color_" + str(effect_colour_index)
         )
         self._instance.local_callback = self.light_local_callback
-        self._rgb_color = (255, 255, 255)
-        self._brightness = None
-        self._is_on = True
 
     @property
     def available(self) -> bool:
@@ -120,7 +119,7 @@ class EffectColourLight(LightEntity):
     @property
     def brightness(self) -> int:
         """The brightness."""
-        return self._brightness
+        return self._attr_brightness
 
     @property
     def brightness_step_pct(self):
@@ -130,7 +129,7 @@ class EffectColourLight(LightEntity):
     @property
     def is_on(self) -> bool | None:
         """Whether the LEDs are on."""
-        return self._is_on
+        return self._attr_is_on
 
     @property
     def supported_features(self) -> LightEntityFeature:
@@ -145,7 +144,7 @@ class EffectColourLight(LightEntity):
     @property
     def rgb_color(self) -> tuple[int, int, int]:
         """Return the hs color value."""
-        return self._rgb_color
+        return self._attr_rgb_color
 
     @property
     def color_mode(self) -> ColorMode:
@@ -169,29 +168,45 @@ class EffectColourLight(LightEntity):
         """We shouldn't poll since it can't provide updates."""
         return False
 
+    async def async_added_to_hass(self) -> None:
+        """Restore state."""
+        await super().async_added_to_hass()
+
+        last_state = await self.async_get_last_state()
+        if last_state is None:
+            return
+
+        self._attr_state = last_state.state
+        self._attr_is_on = last_state.state == STATE_ON
+
+        if ATTR_RGB_COLOR in last_state.attributes:
+            self._attr_rgb_color = last_state.attributes[ATTR_RGB_COLOR]
+        if ATTR_BRIGHTNESS in last_state.attributes:
+            self._attr_brightness = last_state.attributes[ATTR_BRIGHTNESS]
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
         LOGGER.info("Turn on called.  kwargs: %s", str(kwargs))
-        self._is_on = True
+        self._attr_is_on = True
 
         if ATTR_BRIGHTNESS in kwargs:
-            self._brightness = kwargs[ATTR_BRIGHTNESS]
+            self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
 
         if ATTR_RGB_COLOR in kwargs:
-            self._rgb_color = (
+            self._attr_rgb_color = (
                 kwargs[ATTR_RGB_COLOR][0],
                 kwargs[ATTR_RGB_COLOR][1],
                 kwargs[ATTR_RGB_COLOR][2],
             )
 
-        if self._brightness is None:
-            self._brightness = 255
-        brightness_percent = int(self._brightness * 100 / 255)
+        if self._attr_brightness is None:
+            self._attr_brightness = 255
+        brightness_percent = int(self._attr_brightness * 100 / 255)
 
         # Now adjust the RBG values to match the brightness
-        red = int(self._rgb_color[0] * brightness_percent / 100)
-        green = int(self._rgb_color[1] * brightness_percent / 100)
-        blue = int(self._rgb_color[2] * brightness_percent / 100)
+        red = int(self._attr_rgb_color[0] * brightness_percent / 100)
+        green = int(self._attr_rgb_color[1] * brightness_percent / 100)
+        blue = int(self._attr_rgb_color[2] * brightness_percent / 100)
         await self._instance.set_effect_colour(
             self._effect_colour_index, (red, green, blue)
         )
@@ -200,7 +215,7 @@ class EffectColourLight(LightEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
-        self._is_on = False
+        self._attr_is_on = False
         await self._instance.set_effect_colour(self._effect_colour_index, (0, 0, 0))
         self.async_write_ha_state()
 
@@ -221,7 +236,7 @@ class EffectColourLight(LightEntity):
 
 
 class IDEALLEDLight(
-    LightEntity
+    LightEntity, RestoreEntity
 ):  # TODO: Use RestoreEntity to save/load state across reloads
     """The main class representing the LED lights."""
 
@@ -247,7 +262,7 @@ class IDEALLEDLight(
     @property
     def brightness(self) -> int:
         """The brightness."""
-        return self._instance.brightness
+        return self._attr_brightness
 
     @property
     def brightness_step_pct(self):
@@ -256,8 +271,8 @@ class IDEALLEDLight(
 
     @property
     def is_on(self) -> bool | None:
-        """Whther the LEDs are on."""
-        return self._instance.is_on
+        """Whether the LEDs are on."""
+        return self._attr_is_on
 
     @property
     def effect_list(self) -> list[str]:
@@ -267,7 +282,7 @@ class IDEALLEDLight(
     @property
     def effect(self) -> str:
         """The current effect."""
-        return self._instance.effect
+        return self._attr_effect
 
     @property
     def supported_features(self) -> LightEntityFeature:
@@ -282,12 +297,12 @@ class IDEALLEDLight(
     @property
     def rgb_color(self) -> tuple[int, int, int]:
         """Return the hs color value."""
-        return self._instance.rgb_color
+        return self._attr_rgb_color
 
     @property
     def color_mode(self) -> ColorMode:
         """Return the color mode of the light."""
-        return self._instance.color_mode
+        return self._attr_color_mode
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -306,40 +321,68 @@ class IDEALLEDLight(
         """We shouldn't poll since it can't provide updates."""
         return False
 
+    async def async_added_to_hass(self) -> None:
+        """Restore state."""
+        await super().async_added_to_hass()
+
+        last_state = await self.async_get_last_state()
+        if last_state is None:
+            return
+
+        self._attr_state = last_state.state
+        self._attr_is_on = last_state.state == STATE_ON
+
+        if ATTR_RGB_COLOR in last_state.attributes:
+            self._attr_rgb_color = last_state.attributes[ATTR_RGB_COLOR]
+        if ATTR_BRIGHTNESS in last_state.attributes:
+            self._attr_brightness = last_state.attributes[ATTR_BRIGHTNESS]
+        if ATTR_COLOR_MODE in last_state.attributes:
+            self._attr_color_mode = last_state.attributes[ATTR_COLOR_MODE]
+        if ATTR_EFFECT in last_state.attributes:
+            self._attr_effect = last_state.attributes[ATTR_EFFECT]
+            if (
+                self._attr_effect is not None
+            ):  # If there was an effect before, then connecting to the device (which we'll have just done) stops that, so start it again
+                await self._instance.set_effect(
+                    self._attr_effect, self._attr_brightness or 128
+                )
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
         LOGGER.info("Turn on called.  kwargs: %s", str(kwargs))
+
         if not self.is_on:
             await self._instance.turn_on()
 
-        if ATTR_BRIGHTNESS in kwargs and len(kwargs) == 1:
+        if ATTR_BRIGHTNESS in kwargs:
             # Only brightness changed
-            await self._instance.set_brightness(kwargs[ATTR_BRIGHTNESS])
+            self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
+            if len(kwargs) == 1:
+                await self._instance.set_brightness(kwargs[ATTR_BRIGHTNESS])
 
         if ATTR_RGB_COLOR in kwargs:
             if kwargs[ATTR_RGB_COLOR] != self.rgb_color:
-                self._effect = None
-                bri = (
-                    kwargs[ATTR_BRIGHTNESS]
-                    if ATTR_BRIGHTNESS in kwargs
-                    else self._instance.brightness
+                self._attr_effect = None
+                self._attr_rgb_color = kwargs[ATTR_RGB_COLOR]
+                self._attr_color_mode = ColorMode.RGB
+                await self._instance.set_rgb_color(
+                    kwargs[ATTR_RGB_COLOR], self._attr_brightness
                 )
-                await self._instance.set_rgb_color(kwargs[ATTR_RGB_COLOR], bri)
 
         if ATTR_EFFECT in kwargs:
             if kwargs[ATTR_EFFECT] != self.effect:
-                self._effect = kwargs[ATTR_EFFECT]
-                bri = (
-                    kwargs[ATTR_BRIGHTNESS]
-                    if ATTR_BRIGHTNESS in kwargs
-                    else self._instance.brightness
+                self._attr_color_mode = ColorMode.BRIGHTNESS
+                self._attr_effect = kwargs[ATTR_EFFECT]
+                await self._instance.set_effect(
+                    kwargs[ATTR_EFFECT], self._attr_brightness
                 )
-                await self._instance.set_effect(kwargs[ATTR_EFFECT], bri)
+        self._attr_is_on = True
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
         await self._instance.turn_off()
+        self._attr_is_on = False
         self.async_write_ha_state()
 
     async def async_update(self) -> None:
